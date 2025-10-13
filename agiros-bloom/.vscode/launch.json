@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Bloom: generate_cmd (命令式)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/bloom/commands/generate.py",
+      "console": "integratedTerminal",
+      "args": [
+        "agirosdebian",
+        "--ros-distro", "loong",
+        "--os-name", "ubuntu",
+        "--os-version", "jammy"
+      ],
+      "env": {
+        "ROS_DISTRO": "loong",
+        "BLOOM_TEMPLATE_GROUP": "bloom.generators.agirosdebian"
+      }
+    },
+    {
+      "name": "Bloom: generator (分支式)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/bloom/commands/generate.py",
+      "console": "integratedTerminal",
+      "args": [
+        "agirosdebian",
+        "-p", "release",
+        "--ros-distro", "loong",
+        "--os-name", "ubuntu",
+        "--os-version", "jammy"
+      ],
+      "env": {
+        "ROS_DISTRO": "loong",
+        "BLOOM_TEMPLATE_GROUP": "bloom.generators.agirosdebian"
+      }
+    }
+  ]
+}
