@@ -36,15 +36,22 @@ from __future__ import print_function
 import os
 import sys
 import traceback
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from bloom.logging import debug
 from bloom.logging import error
 from bloom.logging import fmt
 from bloom.logging import info
+from bloom.logging import warning
 
 from bloom.generators.debian.generator import generate_substitutions_from_package
 from bloom.generators.debian.generator import place_template_files
 from bloom.generators.debian.generator import process_template_files
+
+# 仅做“别名导入”，在此基础上追加自定义参数；不覆盖本模块函数名
+from bloom.generators.debian.generate_cmd import prepare_arguments as _base_prepare
+from bloom.generators.debian.generate_cmd import main as _base_main
 
 from bloom.rosdistro_api import get_non_eol_distros_prompt
 
@@ -60,23 +67,133 @@ except ImportError:
     debug(traceback.format_exc())
     error("catkin_pkg was not detected, please install it.", exit=True)
 
+try:
+    import yaml
+except Exception:
+    yaml = None
+
+
+def _is_placeholder(s):
+    return isinstance(s, str) and s.startswith(':{')
+
+
+def _locate_tracks(pkg_dir: Path) -> Optional[Path]:
+    """Locate tracks.yaml:
+    1) $OOB_TRACKS_DIR/<pkg>/{tracks.yaml,track.yaml}
+    2) {pkg_dir, pkg_dir.parent}/{tracks.yaml,track.yaml}
+    """
+    env_root = os.environ.get('OOB_TRACKS_DIR', '').strip()
+    candidates = []
+    if env_root:
+        candidates += [
+            Path(env_root) / pkg_dir.name / 'tracks.yaml',
+            Path(env_root) / pkg_dir.name / 'track.yaml',
+        ]
+    candidates += [
+        pkg_dir / 'tracks.yaml',
+        pkg_dir / 'track.yaml',
+        pkg_dir.parent / 'tracks.yaml',
+        pkg_dir.parent / 'track.yaml',
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def _read_tracks(pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, str]:
+    """Extract minimal keys for gbp.conf from tracks.yaml.
+    Returns dict with keys: upstream_branch, release_tag (templates allowed).
+    """
+    result: Dict[str, str] = {}
+    path = _locate_tracks(pkg_dir)
+    if not path or yaml is None:
+        return result
+    try:
+        data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+    except Exception:
+        return result
+    tracks = data.get('tracks', data) if isinstance(data, dict) else {}
+    distro = (tracks_distro or os.environ.get('OOB_TRACKS_DISTRO') or 'jazzy').lower()
+
+    section: Optional[Dict[str, Any]] = None
+    for k, v in tracks.items():
+        if isinstance(k, str) and k.lower() == distro and isinstance(v, dict):
+            section = v
+            break
+    if not section:
+        return result
+
+    # Upstream branch from devel_branch or explicit upstream-branch
+    devel = section.get('devel_branch') or section.get('upstream-branch')
+    version = section.get('version')
+    if isinstance(devel, str) and devel.strip():
+        result['upstream_branch'] = devel.strip()
+    elif isinstance(version, str) and version.strip() and not _is_placeholder(version):
+        result['upstream_branch'] = version.strip()
+    else:
+        result['upstream_branch'] = 'upstream'
+
+    rel_tag = section.get('release_tag') or section.get('release-tag')
+    if isinstance(rel_tag, str) and rel_tag.strip():
+        result['release_tag'] = rel_tag.strip()
+    return result
+
+
+def _ensure_gbp_conf(debian_dir: Path, pkg_dir: Path, tracks_distro: Optional[str]):
+    """Create or patch debian/gbp.conf using tracks.yaml info if available."""
+    debian_dir.mkdir(parents=True, exist_ok=True)
+    gbp = debian_dir / 'gbp.conf'
+
+    vals = _read_tracks(pkg_dir, tracks_distro)
+    upstream_branch = vals.get('upstream_branch', 'upstream')
+    upstream_tag_tpl = vals.get('release_tag', '@(release_tag)')
+
+    if gbp.exists():
+        txt = gbp.read_text(encoding='utf-8')
+
+        def _set(txt0: str, key: str, val: str) -> str:
+            lines = []
+            found = False
+            for line in txt0.splitlines():
+                if line.strip().startswith(f"{key}="):
+                    lines.append(f"{key}={val}")
+                    found = True
+                else:
+                    lines.append(line)
+            if not found:
+                lines.append(f"{key}={val}")
+            return "\n".join(lines) + "\n"
+
+        txt = _set(txt, 'upstream-branch', upstream_branch)
+        txt = _set(txt, 'upstream-tag', upstream_tag_tpl)
+        if 'upstream-tree' not in txt:
+            txt += "\nupstream-tree=tag\n"
+        gbp.write_text(txt, encoding='utf-8')
+    else:
+        content = (
+            "[git-buildpackage]\n"
+            f"upstream-branch={upstream_branch}\n"
+            f"upstream-tag={upstream_tag_tpl}\n"
+            "upstream-tree=tag\n"
+        )
+        gbp.write_text(content, encoding='utf-8')
+        info("Created debian/gbp.conf from tracks.yaml")
+
 
 def prepare_arguments(parser):
-    add = parser.add_argument
-    add('package_path', nargs='?',
-        help="path to or containing the package.xml of a package")
-    action = parser.add_mutually_exclusive_group(required=False)
-    add = action.add_argument
-    add('--place-template-files', action='store_true',
-        help="places debian/* template files only")
-    add('--process-template-files', action='store_true',
-        help="processes templates in debian/* only")
-    add = parser.add_argument
-    add('--os-name', help='OS name, e.g. ubuntu, debian')
-    add('--os-version', help='OS version or codename, e.g. precise, wheezy')
-    add('--ros-distro', help="ROS distro, e.g. %s (used for rosdep)" % get_non_eol_distros_prompt())
-    add('-i', '--debian-inc', help="debian increment number", default='0')
-    add('--native', action='store_true', help="generate native package")
+    # 先注册上游所有参数，再追加两个自定义参数
+    _base_prepare(parser)
+    parser.add_argument(
+        '--generate-gbp',
+        action='store_true',
+        help='Generate/sync debian/gbp.conf from tracks.yaml (no other actions).'
+    )
+    parser.add_argument(
+        '--tracks-distro',
+        default=None,
+        help="Override tracks distro key (fallback to $OOB_TRACKS_DISTRO or 'jazzy')"
+    )
     return parser
 
 
@@ -136,6 +253,14 @@ def main(args=None, get_subs_fn=None):
                 # If neither, do both
                 place_template_files(path, pkg.get_build_type())
                 template_files = process_template_files(path, subs)
+
+            # ---- AGIROS extension: generate/sync gbp.conf ----
+            if getattr(args, 'generate_gbp', False):
+                try:
+                    _ensure_gbp_conf(Path(path) / 'debian', Path(path), args.tracks_distro)
+                except Exception as e:
+                    warning("Skip gbp.conf sync (%s)" % e)
+
             if template_files is not None:
                 for template_file in template_files:
                     os.remove(os.path.normpath(template_file))
@@ -147,8 +272,8 @@ def main(args=None, get_subs_fn=None):
 
 # This describes this command to the loader
 description = dict(
-    title='debian',
-    description="Generates debian packaging files for a catkin package",
+    title='agirosdebian',
+    description="Generates debian packaging files for a catkin package (AGIROS extended)",
     main=main,
     prepare_arguments=prepare_arguments
 )

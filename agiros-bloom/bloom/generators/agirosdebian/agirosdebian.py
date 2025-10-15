@@ -10,10 +10,15 @@ Key points:
 - Read tracks.yaml via env:
     OOB_TRACKS_DIR     -> folder containing many <repo>/tracks.yaml
     OOB_TRACKS_DISTRO  -> distro key, e.g. 'jazzy' (default: 'jazzy')
+
+本实现满足：
+- `bloom-generate agirosdebian ... --generate-gbp` 不再报 unrecognized；
+- 不改变上游分支/模板/提交/打 tag 的整体流程；
+- 当传入 `--generate-gbp` 时，仅生成/同步 `debian/gbp.conf`，其余保持幂等；
+- 模块入口 `bloom.generators.agirosdebian.generate_cmd` 仍可单包调用。
 """
 
 from __future__ import print_function
-
 from pathlib import Path
 import os
 from typing import Any, Dict, Optional
@@ -29,8 +34,6 @@ from bloom.generators.debian.generator import (
     generate_substitutions_from_package,
     place_template_files as base_place_templates,
 )
-from bloom.generators.debian.generate_cmd import main as debian_main
-from bloom.generators.debian.generate_cmd import prepare_arguments
 from bloom.logging import info, warning
 from bloom.util import execute_command
 
@@ -46,13 +49,32 @@ class AgirosDebianGenerator(DebianGenerator):
 
     # ---------------- CLI wiring (preserve upstream args) ----------------
     def prepare_arguments(self, parser):
+        # 保留上游全部参数
+        parser = DebianGenerator.prepare_arguments(self, parser)
+        # 仅追加我们自己的参数（不覆盖上游）
         add = parser.add_argument
-        add('rosdistro', help="AGIROS distro to target (e.g., loong)")
-        return DebianGenerator.prepare_arguments(self, parser)
+        add('--generate-gbp', action='store_true',
+            help='Generate/sync debian/gbp.conf from tracks.yaml (no other actions).')
+        add('--tracks-distro', default=None,
+            help="Override tracks distro key (fallback to $OOB_TRACKS_DISTRO or 'jazzy')")
+        return parser
 
     def handle_arguments(self, args):
-        self.rosdistro = args.rosdistro
+        # 记录 CLI 传参，保持上游行为
+        self.generate_gbp = bool(getattr(args, 'generate_gbp', False))
+        self.tracks_distro = getattr(args, 'tracks_distro', None)
         return DebianGenerator.handle_arguments(self, args)
+
+    # 覆写 generate：当仅需 gbp.conf 时，短路上游完整流程（其它路径不变）
+    def generate(self):
+        if getattr(self, 'generate_gbp', False):
+            pkg_dir = Path(os.getcwd())
+            deb_dir = Path('debian')
+            self._ensure_gbp_conf(deb_dir, pkg_dir, self.tracks_distro)
+            info("Only debian/gbp.conf generated (via --generate-gbp).")
+            return 0
+        # 正常完整生成路径
+        return DebianGenerator.generate(self)
 
     # ---------------- Minimal substitution hook -------------------------
     def get_subs(self, package, debian_distro, releaser_history=None):
@@ -78,6 +100,13 @@ class AgirosDebianGenerator(DebianGenerator):
         2) 提交模板文件（保持上游行为一致）
         3) 将 debian/gbp.conf 与 tracks.yaml 对齐（若可用）
         """
+        # 仅生成 gbp.conf 时，不放置其它模板文件
+        if getattr(self, 'generate_gbp', False):
+            pkg_dir = Path(os.getcwd())
+            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir, self.tracks_distro)
+            info("gbp.conf synchronized with tracks.yaml (generate-gbp mode).")
+            return
+
         # --- (1) 强制模板组为 agirosdebian，确保 gbp.conf.em 被放入 ---
         prev_group = os.environ.get('BLOOM_TEMPLATE_GROUP')
         try:
@@ -98,18 +127,18 @@ class AgirosDebianGenerator(DebianGenerator):
         # --- (3) 同步/生成 gbp.conf ---
         try:
             pkg_dir = Path(os.getcwd())
-            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir)
-            info("gbp.conf synchronized with tracks.yaml (if available)")
+            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir, self.tracks_distro)
+            info("gbp.conf synchronized with tracks.yaml (full generate).")
         except Exception as e:
             warning(f"Skip gbp.conf sync ({e})")
 
     # ---------------------- Tracks / gbp.conf plumbing -------------------
-    def _ensure_gbp_conf(self, debian_dir: Path, pkg_dir: Path):
+    def _ensure_gbp_conf(self, debian_dir: Path, pkg_dir: Path, tracks_distro: Optional[str]):
         """Create or patch debian/gbp.conf with upstream-branch & tag."""
         debian_dir.mkdir(parents=True, exist_ok=True)
         gbp = debian_dir / 'gbp.conf'
 
-        values = self._read_tracks(pkg_dir)
+        values = self._read_tracks(pkg_dir, tracks_distro)
         upstream_branch = values.get('upstream_branch', 'upstream')
         upstream_tag_tpl = values.get('release_tag', '@(release_tag)')
 
@@ -142,7 +171,7 @@ class AgirosDebianGenerator(DebianGenerator):
             lines.append(f"{key}={val}")
         return "\n".join(lines) + "\n"
 
-    def _read_tracks(self, pkg_dir: Path) -> Dict[str, str]:
+    def _read_tracks(self, pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, str]:
         """Read useful keys from tracks.yaml for the current distro."""
         result: Dict[str, str] = {}
         tracks_path = self._locate_tracks(pkg_dir)
@@ -153,7 +182,7 @@ class AgirosDebianGenerator(DebianGenerator):
         except Exception:
             return result
         tracks = data.get('tracks', data) if isinstance(data, dict) else {}
-        distro = (os.environ.get('OOB_TRACKS_DISTRO') or 'jazzy').lower()
+        distro = (tracks_distro or os.environ.get('OOB_TRACKS_DISTRO') or 'jazzy').lower()
 
         section: Optional[Dict[str, Any]] = None
         for k, v in tracks.items():
@@ -172,7 +201,10 @@ class AgirosDebianGenerator(DebianGenerator):
         else:
             result['upstream_branch'] = 'upstream'
 
-        rel_tag = section.get('release_tag') or section.get('release-tag')
+        rel = section.get('release') or {}
+        rel_tag = rel.get('tags') if isinstance(rel, dict) else None
+        if not rel_tag:
+            rel_tag = section.get('release_tag') or section.get('release-tag')
         if isinstance(rel_tag, str) and rel_tag.strip():
             result['release_tag'] = rel_tag.strip()
         return result
@@ -198,14 +230,30 @@ class AgirosDebianGenerator(DebianGenerator):
         return None
 
 
-def main(args=None):
-    # 继续沿用上游入口（不改变既有行为）
-    return debian_main(args, generate_substitutions_from_package)
+# ---------- CLI description for bloom.generate_cmd loader ----------
+# 这里保持与上游一致：loader 会调用我们提供的 prepare_arguments/main
+
+def _cmd_prepare_arguments(parser):
+    # 先让上游 debian cmd 注册全部参数
+    from bloom.generators.debian.generate_cmd import prepare_arguments as _base_prepare
+    _base_prepare(parser)
+    # 仅追加我们自己的参数（与上面类方法保持一致）
+    parser.add_argument('--generate-gbp', action='store_true',
+                        help='Generate/sync debian/gbp.conf from tracks.yaml (no other actions).')
+    parser.add_argument('--tracks-distro', default=None,
+                        help="Override tracks distro key (fallback to $OOB_TRACKS_DISTRO or 'jazzy')")
+    return parser
+
+
+def _cmd_main(args=None, get_subs_fn=None):
+    # 直接复用上游 debian cmd 的 main，保证行为一致；get_subs_fn 用上游的
+    from bloom.generators.debian.generate_cmd import main as _base_main
+    return _base_main(args, generate_substitutions_from_package)
 
 
 description = dict(
     title='agirosdebian',
     description="Generates AGIROS style debian packaging files (extended)",
-    main=main,
-    prepare_arguments=prepare_arguments,
+    main=_cmd_main,
+    prepare_arguments=_cmd_prepare_arguments,
 )

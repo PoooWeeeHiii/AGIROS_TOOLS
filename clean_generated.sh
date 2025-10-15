@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 修改为你的实际路径
 CODE_DIR="${CODE_DIR:-/opt/code_dir}"
 
 # 打印开始信息

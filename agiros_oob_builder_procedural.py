@@ -10,8 +10,16 @@
 - 支持单个源码目录下多个 package.xml 的子包，逐个处理
 - 生成 spec 时优先尝试 openEuler:24（示例），如果 agirosdep 缺失则回退到其他 openEuler 版本
 - 所有缺失的 rosdep rules 会记录到 fail.log，交互默认 "n"
-"""
 
+本次微调：
+- 将 argparse 默认值提取到 **全局 Defaults 区**，保持其余代码不变；
+- 通过 Defaults 提供统一默认值，必要时可被环境变量覆盖。
+- 新增 `--generate-gbp` 开关：在批量生成 debian/ 时，
+  通过给 `bloom-generate agirosdebian` 追加 `--generate-gbp`，并注入
+  `OOB_TRACKS_DIR` / `OOB_TRACKS_DISTRO` 环境变量，批量为各包生成 `debian/gbp.conf`。
+  （其余逻辑保持不变）
+"""
+import shlex
 import argparse
 import os
 import subprocess
@@ -19,23 +27,48 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 import yaml
+import shlex  # 新增：支持把 BLOOM_BIN 解析为多段命令
+
+
+# ----------------------------- Global Defaults -----------------------------
+class Defaults:
+    """集中管理 argparse 默认值，可通过环境变量覆盖。"""
+    ROS_DISTRO: str = os.environ.get("AGIROS_ROS_DISTRO", "loong")
+    UBUNTU_DEFAULT: str = os.environ.get("AGIROS_UBUNTU_DEFAULT", "jammy")
+    OPENEULER_DEFAULT: str = os.environ.get("AGIROS_OE_DEFAULT", "24")
+    # 多值用逗号分隔覆盖：AGIROS_OE_FALLBACK="22,23"
+    OPENEULER_FALLBACK_RAW: str = os.environ.get("AGIROS_OE_FALLBACK", "22,23")
+    OPENEULER_FALLBACK = [v.strip() for v in OPENEULER_FALLBACK_RAW.split(',') if v.strip()]
+    # 修复：在类体内直接定义字段，且默认值为单命令名；允许环境变量传入多段命令（稍后用 shlex.split 解析）
+    BLOOM_BIN: str = os.environ.get(
+        "AGIROS_BLOOM_BIN",
+        "bloom-generate"
+    )
+    LIMIT: int = int(os.environ.get("AGIROS_LIMIT", "0"))
+    DRY_RUN_DEFAULT: bool = bool(int(os.environ.get("AGIROS_DRYRUN", "0")))
+    GENERATE_GBP_DEFAULT: bool = bool(int(os.environ.get("AGIROS_GENERATE_GBP", "0")))
 
 
 def log(msg: str):
     print(msg, flush=True)
 
 
-def run(cmd, cwd=None, dry_run=False):
-    shown = " ".join(cmd)
+def run(cmd, cwd=None, dry_run=False, env: Optional[Dict[str, str]] = None):
+    shown = " ".join(map(str, cmd))
     prefix = "[DRY]" if dry_run else "[RUN]"
-    log(f"{prefix} {shown} (cwd={cwd or os.getcwd()})")
+    env_hint = f" env[OOB_TRACKS_DIR]={env.get('OOB_TRACKS_DIR')}" if env and 'OOB_TRACKS_DIR' in env else ""
+    log(f"{prefix} {shown}{env_hint} (cwd={cwd or os.getcwd()})")
     if dry_run:
         return 0, None
-    proc = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None,
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env if env is not None else os.environ.copy(),
+    )
     out_lines = []
     for line in proc.stdout:
         sys.stdout.write(line)
@@ -49,6 +82,21 @@ def run(cmd, cwd=None, dry_run=False):
     if rc != 0:
         return rc, "\n".join(out_lines)
     return rc, None
+
+def build_cmd_for(kind: str, common_bin: str) -> list:
+    """
+    - kind == 'debian'：优先用环境变量 AGIROS_BLOOM_BIN_DEBIAN
+    - 其他：用 common_bin（即 --bloom-bin）
+    """
+    if kind == 'debian':
+        deb_bin = os.environ.get("AGIROS_BLOOM_BIN_DEBIAN", "").strip()
+        if deb_bin:
+            return shlex.split(deb_bin)
+    return shlex.split(common_bin)
+
+def is_direct_module_cmd(cmd_tokens: list) -> bool:
+    """是否是模块入口（如 '... generate_cmd'），若是则不要再拼子命令名。"""
+    return "generate_cmd" in " ".join(cmd_tokens)
 
 
 # ----------------------------- Resume 检查 -----------------------------
@@ -131,18 +179,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--release-dir", required=True)
     ap.add_argument("--code-dir", required=True)
-    ap.add_argument("--ros-distro", default="loong")
-    ap.add_argument("--ubuntu-default", default="jammy")
+    ap.add_argument("--ros-distro", default=Defaults.ROS_DISTRO)
+    ap.add_argument("--ubuntu-default", default=Defaults.UBUNTU_DEFAULT)
 
     # 将原来的 rhel-* 参数替换为 openeuler-* 参数
-    ap.add_argument("--openeuler-default", default="24",
+    ap.add_argument("--openeuler-default", default=Defaults.OPENEULER_DEFAULT,
                     help="openEuler 首选版本，如 22/23/24")
-    ap.add_argument("--openeuler-fallback", nargs="*", default=["22", "23"],
+    ap.add_argument("--openeuler-fallback", nargs="*", default=Defaults.OPENEULER_FALLBACK,
                     help="openEuler 版本回退列表，按顺序尝试")
 
-    ap.add_argument("--bloom-bin", default="bloom-generate")
-    ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--bloom-bin", default=Defaults.BLOOM_BIN)
+    ap.add_argument("--limit", type=int, default=Defaults.LIMIT)
+    ap.add_argument("--dry-run", action="store_true", default=Defaults.DRY_RUN_DEFAULT)
+
+    # 控制是否在生成 debian 时同步生成 gbp.conf
+    ap.add_argument("--generate-gbp", action="store_true", default=Defaults.GENERATE_GBP_DEFAULT,
+                    help="批量生成 debian/ 时，同时生成 debian/gbp.conf（需 agirosdebian 支持）")
+
     args = ap.parse_args()
 
     release_dir = Path(args.release_dir)
@@ -206,42 +259,62 @@ def main():
 
                 try:
                     if sub_need_ubuntu:
-                        rc, out = run([args.bloom_bin, "agirosdebian", "--ros-distro", args.ros_distro,
-                                      "--os-name", "ubuntu", "--os-version", args.ubuntu_default],
-                                      cwd=subpkg, dry_run=args.dry_run)
+                        base = build_cmd_for('debian', args.bloom_bin)
+                        deb_cmd = base + (["agirosdebian"] if not is_direct_module_cmd(base) else []) + [
+                            "--ros-distro", args.ros_distro,
+                            "--os-name", "ubuntu",
+                            "--os-version", args.ubuntu_default,
+                        ]
+
+                        deb_env = None
+                        if args.generate_gbp:
+                            # 通过环境变量把 tracks 目录与目标 distro 注入给 agirosdebian
+                            deb_env = os.environ.copy()
+                            deb_env["OOB_TRACKS_DIR"] = str(release_dir)
+                            deb_env["OOB_TRACKS_DISTRO"] = "jazzy"
+                            deb_cmd.append("--generate-gbp")
+                        rc, out = run(deb_cmd, cwd=subpkg, dry_run=args.dry_run, env=deb_env)
                         if rc == 0:
                             total += 1
-                            log(f"[OK] {pkg_name}: 已生成 debian/")
+                            log(f"[OK] {pkg_name}: 已生成 debian/ {'(含 gbp.conf)' if args.generate_gbp else ''}")
                         else:
-                            flog.write(f"{pkg_name} ubuntu 失败 rc={rc}\n")
-                            if out:
-                                for l in out.splitlines():
-                                    if "No agirosdep rule for" in l:
-                                        flog.write(f"缺失 rule: {l}\n")
+                            with fail_log.open("a", encoding="utf-8") as flog2:
+                                flog2.write(f"{pkg_name} ubuntu 失败 rc={rc}\n")
+                                if out:
+                                    for l in out.splitlines():
+                                        if "No agirosdep rule for" in l:
+                                            flog2.write(f"缺失 rule: {l}\n")
 
                     if sub_need_oe:
                         versions = [args.openeuler_default] + [v for v in args.openeuler_fallback if v != args.openeuler_default]
                         success = False
                         for ver in versions:
-                            rc, out = run([args.bloom_bin, "agirosrpm", "--ros-distro", args.ros_distro,
-                                          "--os-name", "openeuler", "--os-version", ver],
-                                          cwd=subpkg, dry_run=args.dry_run)
+                            base = build_cmd_for('rpm', args.bloom_bin)
+                            rpm_cmd = base + (["agirosrpm"] if not is_direct_module_cmd(base) else []) + [
+                                "--ros-distro", args.ros_distro,
+                                "--os-name", "openeuler",
+                                "--os-version", ver,
+                            ]
+
+                            rc, out = run(rpm_cmd, cwd=subpkg, dry_run=args.dry_run)
                             if rc == 0:
                                 total += 1
                                 log(f"[OK] {pkg_name}: 已生成 rpm/ (openeuler:{ver})")
                                 success = True
                                 break
                             else:
-                                flog.write(f"{pkg_name} openeuler:{ver} 失败 rc={rc}\n")
-                                if out:
-                                    for l in out.splitlines():
-                                        if "No agirosdep rule for" in l:
-                                            flog.write(f"缺失 rule: {l}\n")
+                                with fail_log.open("a", encoding="utf-8") as flog2:
+                                    flog2.write(f"{pkg_name} openeuler:{ver} 失败 rc={rc}\n")
+                                    if out:
+                                        for l in out.splitlines():
+                                            if "No agirosdep rule for" in l:
+                                                flog2.write(f"缺失 rule: {l}\n")
                         if not success:
                             log(f"[ERR] {pkg_name}: 所有 openEuler 版本均失败")
 
                 except Exception as e:
-                    flog.write(f"{pkg_name} 异常: {e}\n")
+                    with fail_log.open("a", encoding="utf-8") as flog2:
+                        flog2.write(f"{pkg_name} 异常: {e}\n")
                     log(f"[ERR] {pkg_name}: 发生异常 {e}")
 
     log(f"[INFO] 所有包处理完成。成功生成数：{total}")

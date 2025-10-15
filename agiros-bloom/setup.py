@@ -16,6 +16,11 @@ setup(
         'bloom.generators.rpm': [
             'templates/*/*.em',
         ],
+        # 补充：让自定义的 agirosdebian 模板（含 gbp.conf.em）被打包
+        'bloom.generators.agirosdebian': [
+            'templates/*/*',
+            'templates/*/source/*',
+        ],
     },
     install_requires=[
         'catkin_pkg >= 0.4.3',
@@ -71,9 +76,8 @@ generation of platform specific source packages, like debian's src-debs.""",
             'debian = bloom.generators.debian.generate_cmd:description',
             'rpm = bloom.generators.rpm.generate_cmd:description',
             'rosrpm = bloom.generators.rosrpm:description',
-            'agirosdebian = bloom.generators.agirosdebian:description',
+            'agirosdebian = bloom.generators.agirosdebian.generate_cmd:description',
             'agirosrpm = bloom.generators.agirosrpm:description',
         ]
     }
 )
-
