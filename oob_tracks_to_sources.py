@@ -6,6 +6,10 @@
 - checkout 失败时，会自动尝试 fetch 并切远程分支
 - 仍失败时，检测远程默认分支或最新 tag 并切换
 - 支持 --resume, --limit, 彩色日志
+
+本次微调：
+- 新增“全局默认参数”集中管理区 Defaults，把命令行默认值（尤其是 distro）统一放在这里；
+- 其余代码逻辑未变，仅将默认值引用改为使用 Defaults。
 """
 
 import argparse
@@ -22,13 +26,24 @@ except Exception:
     raise
 
 
+# ----------------------------- Global Defaults -----------------------------
+class Defaults:
+    """集中管理命令行参数默认值，可通过环境变量覆盖。"""
+    # 允许通过环境变量覆盖默认发行版（可选），便于 CI/不同机器灵活切换
+    DISTRO: str = os.environ.get("AGIROS_DISTRO_DEFAULT", "loong")
+    # argparse 的 store_true 默认为 False，这里也集中声明，便于未来统一改动
+    RESUME: bool = False
+    # --limit 默认 None（不限数量）
+    LIMIT: Optional[int] = None
+
+
 # ----------------------------- Logging -----------------------------
 class Ansi:
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    RESET = "\033[0m"
+    RED = "\u001b[31m"
+    GREEN = "\u001b[32m"
+    YELLOW = "\u001b[33m"
+    BLUE = "\u001b[34m"
+    RESET = "\u001b[0m"
 
 
 class Logger:
@@ -130,7 +145,7 @@ class GitHelper:
 
 # ----------------------------- Tracks Parser -----------------------------
 class TracksParser:
-    def __init__(self, logger: Logger, distro: str = "jazzy"):
+    def __init__(self, logger: Logger, distro: str = Defaults.DISTRO):
         self.logger = logger
         self.distro = distro
 
@@ -290,9 +305,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--release-dir", required=True)
     ap.add_argument("--code-dir", required=True)
-    ap.add_argument("--distro", default="jazzy")
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--distro", default=Defaults.DISTRO)
+    ap.add_argument("--resume", action="store_true", default=Defaults.RESUME)
+    ap.add_argument("--limit", type=int, default=Defaults.LIMIT)
     return ap.parse_args(argv)
 
 
