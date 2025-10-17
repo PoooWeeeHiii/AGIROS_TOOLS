@@ -246,7 +246,7 @@ def handle_tracks_download(state: MenuState) -> None:
     code_dir = ask_text("源码目录", str(state.code_dir))
     distro = ask_text("Tracks 发行版名称", state.tracks_distro)
     resume = ask_confirm("启用断点续传 (resume)?", default=True)
-    limit_raw = ask_text("限制下载包数量 (留空则全部下载)", "")
+    limit_raw = ask_text("限制下载包数量 (留空表示全部)", "")
     args = [
         f"--release-dir={Path(release_dir).expanduser().resolve()}",
         f"--code-dir={Path(code_dir).expanduser().resolve()}",
@@ -312,6 +312,52 @@ def prompt_package_path(state: MenuState) -> Optional[Path]:
             return None
         return Path(custom).expanduser().resolve()
     index = options.index(choice)
+    return packages[index]
+
+
+def list_existing_packages_by_kind(state: MenuState, kind: str) -> Dict[str, List[Path]]:
+    """Group packages that already have debian/ or rpm/ directories by first letter."""
+    base = state.code_dir
+    grouped: Dict[str, List[Path]] = {}
+    packages = list_code_packages(base)
+    for pkg_path in packages:
+        target_dir = pkg_path / ("debian" if kind == "debian" else "rpm")
+        if not target_dir.is_dir():
+            continue
+        try:
+            rel = pkg_path.relative_to(base)
+        except ValueError:
+            rel = pkg_path
+        label = str(rel)
+        first = label[0].upper() if label else "#"
+        if not first.isalpha():
+            first = "#"
+        grouped.setdefault(first, []).append(pkg_path)
+    for key in grouped:
+        grouped[key].sort(key=lambda p: str(p.relative_to(base)))
+    return dict(sorted(grouped.items(), key=lambda kv: ("#" if kv[0] == "#" else kv[0])))
+
+
+def prompt_existing_package(state: MenuState, kind: str) -> Optional[Path]:
+    grouped = list_existing_packages_by_kind(state, kind)
+    if not grouped:
+        console.print(f"[yellow]未找到包含 {kind} 目录的包。[/]")
+        return None
+    groups = list(grouped.keys())
+    group_choice = ask_select("选择首字母分组", groups + ["返回"])
+    if group_choice in (None, "返回"):
+        return None
+    packages = grouped[group_choice]
+    options = []
+    for p in packages:
+        try:
+            options.append(str(p.relative_to(state.code_dir)))
+        except ValueError:
+            options.append(str(p))
+    pkg_choice = ask_select("选择包", options + ["返回"])
+    if pkg_choice in (None, "返回"):
+        return None
+    index = options.index(pkg_choice)
     return packages[index]
 
 
@@ -404,7 +450,16 @@ def bloom_menu(state: MenuState) -> None:
             continue
         generate_gbp = state.auto_generate_gbp or (choice in {"生成 Debian 目录", "生成 debian+spec", "生成 gbp.conf"} and ask_confirm("生成 gbp.conf?", default=choice != "生成 spec 文件"))
         if scope == "单包":
-            pkg_path = prompt_package_path(state)
+            if choice == "生成 spec 文件":
+                pkg_path = prompt_existing_package(state, "rpm")
+            elif choice == "生成 Debian 目录":
+                pkg_path = prompt_existing_package(state, "debian")
+            elif choice == "生成 debian+spec":
+                pkg_path = prompt_existing_package(state, "debian")
+            elif choice == "生成 gbp.conf":
+                pkg_path = prompt_existing_package(state, "debian")
+            else:
+                pkg_path = prompt_package_path(state)
             if not pkg_path:
                 continue
             if choice == "生成 Debian 目录":
@@ -499,6 +554,7 @@ def run_rpm_build(state: MenuState, path: Path, extra_args: Optional[List[str]] 
             run_stream(["bash", "-lc", user_cmd], cwd=path, env=env)
         # unreachable
 
+    # Fallback: 仍按旧逻辑直接调用 rpmbuild
     rpm_dir = path / "rpm"
     specs = sorted(rpm_dir.glob("*.spec")) if rpm_dir.exists() else []
     if not specs:
@@ -557,11 +613,14 @@ def manage_build_queue(state: MenuState) -> None:
                         removed = state.build_queue.pop(idx)
                         console.print(f"[yellow]已移除 {describe_build_task(removed, state)}[/]")
         elif choice == "添加任务":
-            pkg_path = prompt_package_path(state)
-            if not pkg_path:
-                continue
             kind = ask_select("构建类型", ["debian", "rpm"])
             if not kind:
+                continue
+            if kind == "debian":
+                pkg_path = prompt_existing_package(state, "debian")
+            else:
+                pkg_path = prompt_existing_package(state, "rpm")
+            if not pkg_path:
                 continue
             task = BuildTask(to_display_name(state, pkg_path), pkg_path, kind)
             state.build_queue.append(task)
