@@ -101,11 +101,9 @@ def _locate_tracks(pkg_dir: Path) -> Optional[Path]:
     return None
 
 
-def _read_tracks(pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, str]:
-    """Extract minimal keys for gbp.conf from tracks.yaml.
-    Returns dict with keys: upstream_branch, release_tag (templates allowed).
-    """
-    result: Dict[str, str] = {}
+def _read_tracks(pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, Any]:
+    """Extract release_inc and other keys from tracks.yaml."""
+    result: Dict[str, Any] = {}
     path = _locate_tracks(pkg_dir)
     if not path or yaml is None:
         return result
@@ -114,7 +112,12 @@ def _read_tracks(pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, str]:
     except Exception:
         return result
     tracks = data.get('tracks', data) if isinstance(data, dict) else {}
-    distro = (tracks_distro or os.environ.get('OOB_TRACKS_DISTRO') or 'jazzy').lower()
+    distro = (
+        tracks_distro
+        or os.environ.get('AGIROS_TRACKS_DISTRO')
+        or os.environ.get('OOB_TRACKS_DISTRO')
+        or 'jazzy'
+    ).lower()
 
     section: Optional[Dict[str, Any]] = None
     for k, v in tracks.items():
@@ -124,61 +127,68 @@ def _read_tracks(pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, str]:
     if not section:
         return result
 
-    # Upstream branch from devel_branch or explicit upstream-branch
-    devel = section.get('devel_branch') or section.get('upstream-branch')
+    release_inc = section.get('release_inc')
+    if isinstance(release_inc, (int, float)):
+        release_inc = str(int(release_inc))
+    elif isinstance(release_inc, str):
+        release_inc = release_inc.strip()
+    if release_inc and not _is_placeholder(release_inc):
+        result['release_inc'] = release_inc
     version = section.get('version')
-    if isinstance(devel, str) and devel.strip():
-        result['upstream_branch'] = devel.strip()
-    elif isinstance(version, str) and version.strip() and not _is_placeholder(version):
-        result['upstream_branch'] = version.strip()
-    else:
-        result['upstream_branch'] = 'upstream'
-
-    rel_tag = section.get('release_tag') or section.get('release-tag')
-    if isinstance(rel_tag, str) and rel_tag.strip():
-        result['release_tag'] = rel_tag.strip()
+    if isinstance(version, str) and version.strip() and not _is_placeholder(version):
+        result['track_version'] = version.strip()
     return result
 
 
-def _ensure_gbp_conf(debian_dir: Path, pkg_dir: Path, tracks_distro: Optional[str]):
-    """Create or patch debian/gbp.conf using tracks.yaml info if available."""
+def _resolve_version(pkg_dir: Path) -> Optional[str]:
+    try:
+        pkg = parse_package(str(pkg_dir))
+        return pkg.version
+    except Exception:
+        return None
+
+
+def _resolve_ros_distro(cli_distro: Optional[str]) -> str:
+    candidates = [
+        cli_distro,
+        os.environ.get('AGIROS_DISTRO'),
+        os.environ.get('AGIROS_ROS_DISTRO'),
+        os.environ.get('ROS_DISTRO'),
+    ]
+    for item in candidates:
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+    return 'unknown'
+
+
+def _ensure_gbp_conf(
+    debian_dir: Path,
+    pkg_dir: Path,
+    tracks_distro: Optional[str],
+    cli_distro: Optional[str],
+    pkg_override: Optional[str],
+):
+    """Create or overwrite debian/gbp.conf with computed upstream-tag/tree."""
     debian_dir.mkdir(parents=True, exist_ok=True)
     gbp = debian_dir / 'gbp.conf'
 
-    vals = _read_tracks(pkg_dir, tracks_distro)
-    upstream_branch = vals.get('upstream_branch', 'upstream')
-    upstream_tag_tpl = vals.get('release_tag', '@(release_tag)')
+    track_vals = _read_tracks(pkg_dir, tracks_distro)
+    release_inc = track_vals.get('release_inc') or '0'
+    version = _resolve_version(pkg_dir) or track_vals.get('track_version') or '0.0.0'
+    ros_distro = _resolve_ros_distro(cli_distro)
+    pkg_name = (pkg_override or pkg_dir.name).strip()
+    if not pkg_name:
+        pkg_name = pkg_dir.name
 
-    if gbp.exists():
-        txt = gbp.read_text(encoding='utf-8')
+    upstream_tag = f"release/{ros_distro}/{pkg_name}/{version}-{release_inc}"
 
-        def _set(txt0: str, key: str, val: str) -> str:
-            lines = []
-            found = False
-            for line in txt0.splitlines():
-                if line.strip().startswith(f"{key}="):
-                    lines.append(f"{key}={val}")
-                    found = True
-                else:
-                    lines.append(line)
-            if not found:
-                lines.append(f"{key}={val}")
-            return "\n".join(lines) + "\n"
-
-        txt = _set(txt, 'upstream-branch', upstream_branch)
-        txt = _set(txt, 'upstream-tag', upstream_tag_tpl)
-        if 'upstream-tree' not in txt:
-            txt += "\nupstream-tree=tag\n"
-        gbp.write_text(txt, encoding='utf-8')
-    else:
-        content = (
-            "[git-buildpackage]\n"
-            f"upstream-branch={upstream_branch}\n"
-            f"upstream-tag={upstream_tag_tpl}\n"
-            "upstream-tree=tag\n"
-        )
-        gbp.write_text(content, encoding='utf-8')
-        info("Created debian/gbp.conf from tracks.yaml")
+    content = (
+        "[git-buildpackage]\n"
+        f"upstream-tag={upstream_tag}\n"
+        "upstream-tree=tag\n"
+    )
+    gbp.write_text(content, encoding='utf-8')
+    info(f"gbp.conf updated with upstream-tag={upstream_tag}")
 
 
 def prepare_arguments(parser):
@@ -193,6 +203,16 @@ def prepare_arguments(parser):
         '--tracks-distro',
         default=None,
         help="Override tracks distro key (fallback to $OOB_TRACKS_DISTRO or 'jazzy')"
+    )
+    parser.add_argument(
+        '--pkg',
+        default=None,
+        help="Override package name used in upstream-tag (default: directory name)"
+    )
+    parser.add_argument(
+        '--distro',
+        default=None,
+        help="AGIROS distro name for release tag (fallback to $AGIROS_DISTRO)"
     )
     return parser
 
@@ -257,7 +277,13 @@ def main(args=None, get_subs_fn=None):
             # ---- AGIROS extension: generate/sync gbp.conf ----
             if getattr(args, 'generate_gbp', False):
                 try:
-                    _ensure_gbp_conf(Path(path) / 'debian', Path(path), args.tracks_distro)
+                    _ensure_gbp_conf(
+                        Path(path) / 'debian',
+                        Path(path),
+                        args.tracks_distro,
+                        getattr(args, 'distro', None),
+                        getattr(args, 'pkg', None),
+                    )
                 except Exception as e:
                     warning("Skip gbp.conf sync (%s)" % e)
 
@@ -277,3 +303,4 @@ description = dict(
     main=main,
     prepare_arguments=prepare_arguments
 )
+from catkin_pkg.package import parse_package
