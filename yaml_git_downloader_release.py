@@ -8,6 +8,7 @@ import datetime
 # ---------------- 全局配置 ----------------
 TARGET_DIR = os.environ.get("AGIROS_RELEASE_TARGET_DIR", "ros2_release_dir")
 LOG_FILE = os.path.join(TARGET_DIR, "download_log.txt")
+GIT_CLONE_TIMEOUT = int(os.environ.get("AGIROS_GIT_CLONE_TIMEOUT", "600"))
 
 # ANSI 颜色定义
 class Color:
@@ -53,16 +54,28 @@ def safe_git_clone_or_resume(repo_url, repo_path):
                 log_message(f"[Error] {repo_path} fetch/reset 失败。", Color.RED)
                 return False
         else:
-            log_message(f"[Error] {repo_path} 已存在但不是 Git 仓库。", Color.RED)
-            return False
+            log_message(
+                f"[Info] {repo_path} 已存在且缺少 .git 目录，判定为手动准备的包，跳过 git clone。",
+                Color.BLUE,
+            )
+            return True
     else:
         try:
-            subprocess.run(["git", "clone", repo_url, repo_path],
-                           check=True,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "clone", repo_url, repo_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=GIT_CLONE_TIMEOUT,
+            )
             log_message(f"[OK] 成功克隆 {repo_url} → {repo_path}", Color.GREEN)
             return True
+        except subprocess.TimeoutExpired:
+            log_message(
+                f"[Warning] 克隆超时：{repo_url} → {repo_path}，已运行超过 {GIT_CLONE_TIMEOUT}s。",
+                Color.YELLOW,
+            )
+            return False
         except subprocess.CalledProcessError:
             log_message(f"[Error] 克隆失败：{repo_url} → {repo_path}", Color.RED)
             return False
