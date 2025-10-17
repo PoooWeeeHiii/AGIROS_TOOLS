@@ -28,6 +28,8 @@ try:
 except Exception:
     yaml = None
 
+from catkin_pkg.package import parse_package
+
 from bloom.generators.common import default_fallback_resolver
 from bloom.generators.debian import DebianGenerator
 from bloom.generators.debian.generator import (
@@ -57,12 +59,18 @@ class AgirosDebianGenerator(DebianGenerator):
             help='Generate/sync debian/gbp.conf from tracks.yaml (no other actions).')
         add('--tracks-distro', default=None,
             help="Override tracks distro key (fallback to $OOB_TRACKS_DISTRO or 'jazzy')")
+        add('--pkg', default=None,
+            help="Override package name used in upstream-tag (default: directory name)")
+        add('--distro', default=None,
+            help="AGIROS distro name for release tag (fallback to $AGIROS_DISTRO)")
         return parser
 
     def handle_arguments(self, args):
         # 记录 CLI 传参，保持上游行为
         self.generate_gbp = bool(getattr(args, 'generate_gbp', False))
         self.tracks_distro = getattr(args, 'tracks_distro', None)
+        self.pkg_override = getattr(args, 'pkg', None)
+        self.distro_override = getattr(args, 'distro', None)
         return DebianGenerator.handle_arguments(self, args)
 
     # 覆写 generate：当仅需 gbp.conf 时，短路上游完整流程（其它路径不变）
@@ -70,7 +78,7 @@ class AgirosDebianGenerator(DebianGenerator):
         if getattr(self, 'generate_gbp', False):
             pkg_dir = Path(os.getcwd())
             deb_dir = Path('debian')
-            self._ensure_gbp_conf(deb_dir, pkg_dir, self.tracks_distro)
+            self._ensure_gbp_conf(deb_dir, pkg_dir, self.tracks_distro, self.distro_override, self.pkg_override)
             info("Only debian/gbp.conf generated (via --generate-gbp).")
             return 0
         # 正常完整生成路径
@@ -103,7 +111,7 @@ class AgirosDebianGenerator(DebianGenerator):
         # 仅生成 gbp.conf 时，不放置其它模板文件
         if getattr(self, 'generate_gbp', False):
             pkg_dir = Path(os.getcwd())
-            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir, self.tracks_distro)
+            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir, self.tracks_distro, self.distro_override, self.pkg_override)
             info("gbp.conf synchronized with tracks.yaml (generate-gbp mode).")
             return
 
@@ -127,53 +135,61 @@ class AgirosDebianGenerator(DebianGenerator):
         # --- (3) 同步/生成 gbp.conf ---
         try:
             pkg_dir = Path(os.getcwd())
-            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir, self.tracks_distro)
+            self._ensure_gbp_conf(Path(debian_dir).resolve(), pkg_dir, self.tracks_distro, self.distro_override, self.pkg_override)
             info("gbp.conf synchronized with tracks.yaml (full generate).")
         except Exception as e:
             warning(f"Skip gbp.conf sync ({e})")
 
     # ---------------------- Tracks / gbp.conf plumbing -------------------
-    def _ensure_gbp_conf(self, debian_dir: Path, pkg_dir: Path, tracks_distro: Optional[str]):
-        """Create or patch debian/gbp.conf with upstream-branch & tag."""
+    def _ensure_gbp_conf(
+        self,
+        debian_dir: Path,
+        pkg_dir: Path,
+        tracks_distro: Optional[str],
+        cli_distro: Optional[str],
+        pkg_override: Optional[str],
+    ):
+        """Create or overwrite debian/gbp.conf with computed upstream-tag/tree."""
         debian_dir.mkdir(parents=True, exist_ok=True)
         gbp = debian_dir / 'gbp.conf'
 
         values = self._read_tracks(pkg_dir, tracks_distro)
-        upstream_branch = values.get('upstream_branch', 'upstream')
-        upstream_tag_tpl = values.get('release_tag', '@(release_tag)')
+        release_inc = values.get('release_inc') or '0'
+        version = self._resolve_version(pkg_dir) or values.get('track_version') or '0.0.0'
+        ros_distro = self._resolve_ros_distro(cli_distro)
+        pkg_name = (pkg_override or pkg_dir.name).strip() or pkg_dir.name
 
-        if gbp.exists():
-            txt = gbp.read_text(encoding='utf-8')
-            txt = self._set_conf_key(txt, 'upstream-branch', upstream_branch)
-            txt = self._set_conf_key(txt, 'upstream-tag', upstream_tag_tpl)
-            if 'upstream-tree' not in txt:
-                txt += "\nupstream-tree=tag\n"
-            gbp.write_text(txt, encoding='utf-8')
-        else:
-            content = (
-                "[git-buildpackage]\n"
-                f"upstream-branch={upstream_branch}\n"
-                f"upstream-tag={upstream_tag_tpl}\n"
-                "upstream-tree=tag\n"
-            )
-            gbp.write_text(content, encoding='utf-8')
+        upstream_tag = f"release/{ros_distro}/{pkg_name}/{version}-{release_inc}"
 
-    def _set_conf_key(self, txt: str, key: str, val: str) -> str:
-        lines = []
-        found = False
-        for line in txt.splitlines():
-            if line.strip().startswith(f"{key}="):
-                lines.append(f"{key}={val}")
-                found = True
-            else:
-                lines.append(line)
-        if not found:
-            lines.append(f"{key}={val}")
-        return "\n".join(lines) + "\n"
+        content = (
+            "[git-buildpackage]\n"
+            f"upstream-tag={upstream_tag}\n"
+            "upstream-tree=tag\n"
+        )
+        gbp.write_text(content, encoding='utf-8')
 
-    def _read_tracks(self, pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, str]:
-        """Read useful keys from tracks.yaml for the current distro."""
-        result: Dict[str, str] = {}
+    def _resolve_version(self, pkg_dir: Path) -> Optional[str]:
+        try:
+            pkg = parse_package(str(pkg_dir))
+            return pkg.version
+        except Exception:
+            return None
+
+    def _resolve_ros_distro(self, cli_distro: Optional[str]) -> str:
+        candidates = [
+            cli_distro,
+            os.environ.get('AGIROS_DISTRO'),
+            os.environ.get('AGIROS_ROS_DISTRO'),
+            os.environ.get('ROS_DISTRO'),
+        ]
+        for item in candidates:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return 'unknown'
+
+    def _read_tracks(self, pkg_dir: Path, tracks_distro: Optional[str]) -> Dict[str, Any]:
+        """Read release_inc and related keys from tracks.yaml for the current distro."""
+        result: Dict[str, Any] = {}
         tracks_path = self._locate_tracks(pkg_dir)
         if not tracks_path or yaml is None:
             return result
@@ -182,7 +198,12 @@ class AgirosDebianGenerator(DebianGenerator):
         except Exception:
             return result
         tracks = data.get('tracks', data) if isinstance(data, dict) else {}
-        distro = (tracks_distro or os.environ.get('OOB_TRACKS_DISTRO') or 'jazzy').lower()
+        distro = (
+            tracks_distro
+            or os.environ.get('AGIROS_TRACKS_DISTRO')
+            or os.environ.get('OOB_TRACKS_DISTRO')
+            or 'jazzy'
+        ).lower()
 
         section: Optional[Dict[str, Any]] = None
         for k, v in tracks.items():
@@ -192,21 +213,17 @@ class AgirosDebianGenerator(DebianGenerator):
         if not section:
             return result
 
-        devel = section.get('devel_branch') or section.get('upstream-branch')
-        version = section.get('version')
-        if isinstance(devel, str) and devel.strip():
-            result['upstream_branch'] = devel.strip()
-        elif isinstance(version, str) and version.strip() and not _is_placeholder(version):
-            result['upstream_branch'] = version.strip()
-        else:
-            result['upstream_branch'] = 'upstream'
+        release_inc = section.get('release_inc')
+        if isinstance(release_inc, (int, float)):
+            release_inc = str(int(release_inc))
+        elif isinstance(release_inc, str):
+            release_inc = release_inc.strip()
+        if release_inc and not _is_placeholder(release_inc):
+            result['release_inc'] = release_inc
 
-        rel = section.get('release') or {}
-        rel_tag = rel.get('tags') if isinstance(rel, dict) else None
-        if not rel_tag:
-            rel_tag = section.get('release_tag') or section.get('release-tag')
-        if isinstance(rel_tag, str) and rel_tag.strip():
-            result['release_tag'] = rel_tag.strip()
+        version = section.get('version')
+        if isinstance(version, str) and version.strip() and not _is_placeholder(version):
+            result['track_version'] = version.strip()
         return result
 
     def _locate_tracks(self, pkg_dir: Path) -> Optional[Path]:
