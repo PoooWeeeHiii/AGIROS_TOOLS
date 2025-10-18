@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+import json
 import os
 import shlex
 import sys
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 try:
     from rich import box
@@ -149,7 +150,19 @@ class MenuState:
     deb_parallel: str = os.environ.get("PARALLEL", str(os.cpu_count() or 4))
     git_user_name: str = os.environ.get("GIT_USER_NAME", "PoooWeeeHiii")
     git_user_email: str = os.environ.get("GIT_USER_EMAIL", "powehi041210@gmail.com")
+    queue_file: Path = Path(os.environ.get("AGIROS_QUEUE_FILE", str(REPO_ROOT / "build_queue.txt")))
     build_queue: List[BuildTask] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.queue_file = self._normalize_path(self.queue_file)
+        self.ensure_queue_file()
+        self.load_queue_from_file()
+
+    def _normalize_path(self, value: Union[str, Path]) -> Path:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = (REPO_ROOT / path).resolve()
+        return path
 
     def update_env(self) -> None:
         mappings = {
@@ -172,9 +185,140 @@ class MenuState:
             "PARALLEL": self.deb_parallel,
             "GIT_USER_NAME": self.git_user_name,
             "GIT_USER_EMAIL": self.git_user_email,
+            "AGIROS_QUEUE_FILE": str(self.queue_file),
         }
         for key, value in mappings.items():
             os.environ[key] = value
+
+    def refresh_from_env(self) -> None:
+        """Sync state fields from process-wide environment variables."""
+        env = os.environ
+
+        def _set_path(env_key: str, attr: str) -> None:
+            value = env.get(env_key)
+            if not value:
+                return
+            if attr == "queue_file":
+                path = self._normalize_path(value)
+            else:
+                path = Path(value).expanduser()
+                try:
+                    path = path.resolve()
+                except Exception:
+                    pass
+            setattr(self, attr, path)
+
+        def _set_str(env_key: str, attr: str) -> None:
+            value = env.get(env_key)
+            if value:
+                setattr(self, attr, value)
+
+        def _set_bool(env_key: str, attr: str) -> None:
+            if env_key not in env:
+                return
+            value = env.get(env_key, "")
+            setattr(self, attr, value.lower() not in {"0", "", "false"})
+
+        def _set_list(env_key: str, attr: str) -> None:
+            raw = env.get(env_key)
+            if raw is None:
+                return
+            items = [item.strip() for item in raw.split(",") if item.strip()]
+            setattr(self, attr, items)
+
+        _set_path("AGIROS_RELEASE_DIR", "release_dir")
+        _set_path("AGIROS_CODE_DIR", "code_dir")
+        _set_path("DEB_OUT", "deb_out_dir")
+        _set_str("AGIROS_CODE_LABEL", "code_label")
+        _set_str("AGIROS_TRACKS_DISTRO", "tracks_distro")
+        _set_str("AGIROS_ROS_DISTRO", "ros_distro")
+        _set_str("AGIROS_UBUNTU_DEFAULT", "ubuntu_version")
+        _set_str("AGIROS_OE_DEFAULT", "openeuler_default")
+        _set_list("AGIROS_OE_FALLBACK", "openeuler_fallback")
+        _set_str("AGIROS_BLOOM_BIN", "bloom_bin")
+        _set_bool("AGIROS_GENERATE_GBP", "auto_generate_gbp")
+        _set_str("AGIROS_RPMBUILD_BIN", "rpm_build_base")
+        _set_str("DISTRO", "deb_distro")
+        _set_str("DEFAULT_REL_INC", "deb_release_inc")
+        _set_str("PARALLEL", "deb_parallel")
+        _set_str("GIT_USER_NAME", "git_user_name")
+        _set_str("GIT_USER_EMAIL", "git_user_email")
+        _set_path("AGIROS_QUEUE_FILE", "queue_file")
+        self.ensure_queue_file()
+        self.load_queue_from_file()
+
+    def ensure_queue_file(self) -> None:
+        path = self.queue_file
+        parent = path.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.touch()
+
+    def _serialize_task(self, task: BuildTask) -> str:
+        data = {
+            "name": task.display_name,
+            "kind": task.kind,
+            "path": str(task.path),
+            "extra_args": task.extra_args,
+        }
+        return json.dumps(data, ensure_ascii=False)
+
+    def _deserialize_task(self, raw: str) -> Optional[BuildTask]:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        name = data.get("name")
+        kind = data.get("kind")
+        path_str = data.get("path")
+        if not name or not kind or not path_str:
+            return None
+        path = Path(path_str).expanduser()
+        extra_raw = data.get("extra_args")
+        if isinstance(extra_raw, list):
+            extra_args = [str(item) for item in extra_raw]
+        elif extra_raw:
+            extra_args = [str(extra_raw)]
+        else:
+            extra_args = []
+        return BuildTask(display_name=name, path=path, kind=kind, extra_args=extra_args)
+
+    def load_queue_from_file(self) -> List[BuildTask]:
+        path = self.queue_file
+        if not path.exists():
+            self.build_queue = []
+            return []
+        tasks: List[BuildTask] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                task = self._deserialize_task(line)
+                if task:
+                    tasks.append(task)
+        self.build_queue = tasks
+        return tasks
+
+    def save_queue(self, tasks: Optional[List[BuildTask]] = None) -> None:
+        tasks = list(tasks if tasks is not None else self.build_queue)
+        self.ensure_queue_file()
+        with self.queue_file.open("w", encoding="utf-8") as handle:
+            for task in tasks:
+                handle.write(self._serialize_task(task) + "\n")
+        self.build_queue = tasks
+
+    def append_task_to_queue(self, task: BuildTask) -> None:
+        self.ensure_queue_file()
+        with self.queue_file.open("a", encoding="utf-8") as handle:
+            handle.write(self._serialize_task(task) + "\n")
+        self.build_queue.append(task)
+
+    def clear_queue(self) -> None:
+        self.ensure_queue_file()
+        self.queue_file.write_text("", encoding="utf-8")
+        self.build_queue = []
 
     def summary_rows(self) -> List[Tuple[str, str]]:
         return [
@@ -195,11 +339,13 @@ class MenuState:
             ("Debian release_inc", self.deb_release_inc),
             ("并行构建线程", self.deb_parallel),
             ("Git User", f"{self.git_user_name} <{self.git_user_email}>"),
+            ("队列文件", str(self.queue_file)),
             ("构建队列", f"{len(self.build_queue)} 项"),
         ]
 
 
 def render_state_panel(state: MenuState) -> None:
+    state.refresh_from_env()
     table = Table.grid(expand=False)
     table.add_column(justify="right", style="cyan", no_wrap=True)
     table.add_column(style="white", overflow="fold")
@@ -246,7 +392,7 @@ def handle_tracks_download(state: MenuState) -> None:
     code_dir = ask_text("源码目录", str(state.code_dir))
     distro = ask_text("Tracks 发行版名称", state.tracks_distro)
     resume = ask_confirm("启用断点续传 (resume)?", default=True)
-    limit_raw = ask_text("限制下载包数量 (留空表示全部)", "")
+    limit_raw = ask_text("限制下载包数量 (留空则全部下载)", "")
     args = [
         f"--release-dir={Path(release_dir).expanduser().resolve()}",
         f"--code-dir={Path(code_dir).expanduser().resolve()}",
@@ -297,68 +443,48 @@ def list_code_packages(code_dir: Path) -> List[Path]:
 
 def prompt_package_path(state: MenuState) -> Optional[Path]:
     packages = list_code_packages(state.code_dir)
-    options = []
-    for p in packages:
-        try:
-            options.append(str(p.relative_to(state.code_dir)))
-        except ValueError:
-            options.append(str(p))
-    choice = ask_select("选择源码包目录", options + ["手动输入", "返回"]) if options else "手动输入"
-    if choice in (None, "返回"):
+    if not packages:
+        console.print("[yellow]未在源码目录中发现包，建议手动输入路径。[/]")
+
+    def _resolve_package(choice_name: str) -> Optional[Path]:
+        for pkg in packages:
+            if to_display_name(state, pkg) == choice_name:
+                return pkg
         return None
-    if choice == "手动输入":
-        custom = ask_text("请输入源码包路径", "")
-        if not custom:
+
+    while True:
+        choice = ask_select("选择源码包目录", ["关键字查询", "手动输入", "返回"])
+        if choice in (None, "返回"):
             return None
-        return Path(custom).expanduser().resolve()
-    index = options.index(choice)
-    return packages[index]
-
-
-def list_existing_packages_by_kind(state: MenuState, kind: str) -> Dict[str, List[Path]]:
-    """Group packages that already have debian/ or rpm/ directories by first letter."""
-    base = state.code_dir
-    grouped: Dict[str, List[Path]] = {}
-    packages = list_code_packages(base)
-    for pkg_path in packages:
-        target_dir = pkg_path / ("debian" if kind == "debian" else "rpm")
-        if not target_dir.is_dir():
-            continue
-        try:
-            rel = pkg_path.relative_to(base)
-        except ValueError:
-            rel = pkg_path
-        label = str(rel)
-        first = label[0].upper() if label else "#"
-        if not first.isalpha():
-            first = "#"
-        grouped.setdefault(first, []).append(pkg_path)
-    for key in grouped:
-        grouped[key].sort(key=lambda p: str(p.relative_to(base)))
-    return dict(sorted(grouped.items(), key=lambda kv: ("#" if kv[0] == "#" else kv[0])))
-
-
-def prompt_existing_package(state: MenuState, kind: str) -> Optional[Path]:
-    grouped = list_existing_packages_by_kind(state, kind)
-    if not grouped:
-        console.print(f"[yellow]未找到包含 {kind} 目录的包。[/]")
-        return None
-    groups = list(grouped.keys())
-    group_choice = ask_select("选择首字母分组", groups + ["返回"])
-    if group_choice in (None, "返回"):
-        return None
-    packages = grouped[group_choice]
-    options = []
-    for p in packages:
-        try:
-            options.append(str(p.relative_to(state.code_dir)))
-        except ValueError:
-            options.append(str(p))
-    pkg_choice = ask_select("选择包", options + ["返回"])
-    if pkg_choice in (None, "返回"):
-        return None
-    index = options.index(pkg_choice)
-    return packages[index]
+        if choice == "手动输入":
+            custom = ask_text("请输入源码包路径", "")
+            if not custom:
+                continue
+            return Path(custom).expanduser().resolve()
+        if choice == "关键字查询":
+            keyword = ask_text("请输入匹配关键字", "")
+            if not keyword:
+                console.print("[yellow]未输入关键字。[/]")
+                continue
+            keyword_lower = keyword.lower()
+            matches: List[Tuple[str, Path]] = []
+            for pkg in packages:
+                display = to_display_name(state, pkg)
+                if keyword_lower in display.lower():
+                    matches.append((display, pkg))
+            if not matches:
+                console.print(f"[yellow]未找到匹配 \"{keyword}\" 的源码包。[/]")
+                continue
+            display_choices = [name for name, _ in matches] + ["重新搜索", "返回"]
+            selection = ask_select("匹配的源码包", display_choices)
+            if selection in (None, "返回"):
+                continue
+            if selection == "重新搜索":
+                continue
+            pkg_path = _resolve_package(selection)
+            if pkg_path:
+                return pkg_path
+            console.print("[red]选择的包无法解析，请重试。[/]")
 
 
 def build_bloom_command(state: MenuState, kind: str) -> List[str]:
@@ -450,37 +576,28 @@ def bloom_menu(state: MenuState) -> None:
             continue
         generate_gbp = state.auto_generate_gbp or (choice in {"生成 Debian 目录", "生成 debian+spec", "生成 gbp.conf"} and ask_confirm("生成 gbp.conf?", default=choice != "生成 spec 文件"))
         if scope == "单包":
-            if choice == "生成 spec 文件":
-                pkg_path = prompt_existing_package(state, "rpm")
-            elif choice == "生成 Debian 目录":
-                pkg_path = prompt_existing_package(state, "debian")
-            elif choice == "生成 debian+spec":
-                pkg_path = prompt_existing_package(state, "debian")
-            elif choice == "生成 gbp.conf":
-                pkg_path = prompt_existing_package(state, "debian")
-            else:
-                pkg_path = prompt_package_path(state)
+            pkg_path = prompt_package_path(state)
             if not pkg_path:
                 continue
             if choice == "生成 Debian 目录":
                 run_single_bloom(state, "debian", pkg_path, generate_gbp)
                 if ask_confirm("将 Debian 构建加入队列?", default=False):
-                    state.build_queue.append(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
+                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
             elif choice == "生成 spec 文件":
                 run_single_bloom(state, "rpm", pkg_path)
                 if ask_confirm("将 RPM 构建加入队列?", default=False):
-                    state.build_queue.append(BuildTask(to_display_name(state, pkg_path), pkg_path, "rpm"))
+                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "rpm"))
             elif choice == "生成 debian+spec":
                 run_single_bloom(state, "debian", pkg_path, generate_gbp)
                 run_single_bloom(state, "rpm", pkg_path)
                 if ask_confirm("将 Debian 构建加入队列?", default=False):
-                    state.build_queue.append(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
+                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
                 if ask_confirm("将 RPM 构建加入队列?", default=False):
-                    state.build_queue.append(BuildTask(to_display_name(state, pkg_path), pkg_path, "rpm"))
+                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "rpm"))
             else:
                 run_single_bloom(state, "gbp", pkg_path, True)
                 if ask_confirm("将 Debian 构建加入队列?", default=False):
-                    state.build_queue.append(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
+                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
         else:
             mode = {
                 "生成 Debian 目录": "debian",
@@ -554,7 +671,6 @@ def run_rpm_build(state: MenuState, path: Path, extra_args: Optional[List[str]] 
             run_stream(["bash", "-lc", user_cmd], cwd=path, env=env)
         # unreachable
 
-    # Fallback: 仍按旧逻辑直接调用 rpmbuild
     rpm_dir = path / "rpm"
     specs = sorted(rpm_dir.glob("*.spec")) if rpm_dir.exists() else []
     if not specs:
@@ -589,6 +705,7 @@ def execute_build(task: BuildTask, state: MenuState) -> bool:
 
 def manage_build_queue(state: MenuState) -> None:
     while True:
+        state.load_queue_from_file()
         options = [
             "查看队列",
             "添加任务",
@@ -611,30 +728,30 @@ def manage_build_queue(state: MenuState) -> None:
                     idx = int(idx_raw) - 1
                     if 0 <= idx < len(state.build_queue):
                         removed = state.build_queue.pop(idx)
+                        state.save_queue()
                         console.print(f"[yellow]已移除 {describe_build_task(removed, state)}[/]")
         elif choice == "添加任务":
+            pkg_path = prompt_package_path(state)
+            if not pkg_path:
+                continue
             kind = ask_select("构建类型", ["debian", "rpm"])
             if not kind:
                 continue
-            if kind == "debian":
-                pkg_path = prompt_existing_package(state, "debian")
-            else:
-                pkg_path = prompt_existing_package(state, "rpm")
-            if not pkg_path:
-                continue
             task = BuildTask(to_display_name(state, pkg_path), pkg_path, kind)
-            state.build_queue.append(task)
+            state.append_task_to_queue(task)
         elif choice == "执行队列":
             if not state.build_queue:
                 console.print("[cyan]队列为空[/]")
                 continue
             failed = []
-            for task in list(state.build_queue):
+            tasks_to_run = list(state.build_queue)
+            for index, task in enumerate(tasks_to_run):
                 if not execute_build(task, state):
                     failed.append(task)
                     if not ask_confirm("继续执行剩余任务?", default=True):
+                        failed.extend(tasks_to_run[index + 1 :])
                         break
-            state.build_queue = failed
+            state.save_queue(failed)
             if failed:
                 console.print("[yellow]以下任务未完成，已保留在队列：[/]")
                 for task in failed:
@@ -642,7 +759,7 @@ def manage_build_queue(state: MenuState) -> None:
             else:
                 console.print("[green]队列全部完成[/]")
         elif choice == "清空队列":
-            state.build_queue.clear()
+            state.clear_queue()
             console.print("[yellow]构建队列已清空[/]")
         elif choice == "编辑构建参数":
             edit_build_parameters(state)
@@ -693,6 +810,7 @@ def handle_configuration(state: MenuState) -> None:
                 "修改 ROS/Tracks 配置",
                 "修改 openEuler 参数",
                 "修改 Bloom 命令",
+                "修改 构建队列文件路径",
                 "修改 Debian 构建配置",
                 "返回",
             ],
@@ -729,6 +847,12 @@ def handle_configuration(state: MenuState) -> None:
             bloom = ask_text("bloom 可执行命令", state.bloom_bin)
             if bloom:
                 state.bloom_bin = bloom
+        elif choice == "修改 构建队列文件路径":
+            value = ask_text("构建队列文件路径", str(state.queue_file))
+            if value:
+                state.queue_file = state._normalize_path(value)
+                state.ensure_queue_file()
+                state.load_queue_from_file()
         elif choice == "修改 Debian 构建配置":
             code_label = ask_text("主界面源码前缀标签", state.code_label)
             deb_out = ask_text("Debian 输出目录", str(state.deb_out_dir))
