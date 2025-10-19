@@ -152,14 +152,18 @@ class MenuState:
     git_user_name: str = os.environ.get("GIT_USER_NAME", "PoooWeeeHiii")
     git_user_email: str = os.environ.get("GIT_USER_EMAIL", "powehi041210@gmail.com")
     queue_file: Path = Path(os.environ.get("AGIROS_QUEUE_FILE", str(REPO_ROOT / "build_queue.txt")))
+    queue_meta_file: Path = Path(os.environ.get("AGIROS_QUEUE_META", ""))
     build_queue: List[BuildTask] = field(default_factory=list)
     queue_packages: List[str] = field(default_factory=list)
     package_status: Dict[str, bool] = field(default_factory=dict)
-    queue_meta_file: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.queue_file = self._normalize_path(self.queue_file)
-        self.queue_meta_file = self._meta_path_for_queue(self.queue_file)
+        queue_meta_env = os.environ.get("AGIROS_QUEUE_META")
+        if queue_meta_env:
+            self.queue_meta_file = self._normalize_path(queue_meta_env)
+        else:
+            self.queue_meta_file = self._meta_path_for_queue(self.queue_file)
         self.ensure_queue_file()
         self.load_queue_from_file()
 
@@ -195,6 +199,7 @@ class MenuState:
             "GIT_USER_NAME": self.git_user_name,
             "GIT_USER_EMAIL": self.git_user_email,
             "AGIROS_QUEUE_FILE": str(self.queue_file),
+            "AGIROS_QUEUE_META": str(self.queue_meta_file),
         }
         for key, value in mappings.items():
             os.environ[key] = value
@@ -254,7 +259,10 @@ class MenuState:
         _set_str("GIT_USER_NAME", "git_user_name")
         _set_str("GIT_USER_EMAIL", "git_user_email")
         _set_path("AGIROS_QUEUE_FILE", "queue_file")
-        self.queue_meta_file = self._meta_path_for_queue(self.queue_file)
+        if env.get("AGIROS_QUEUE_META"):
+            _set_path("AGIROS_QUEUE_META", "queue_meta_file")
+        else:
+            self.queue_meta_file = self._meta_path_for_queue(self.queue_file)
         self.ensure_queue_file()
         self.load_queue_from_file()
 
@@ -514,6 +522,7 @@ class MenuState:
             ("并行构建线程", self.deb_parallel),
             ("Git User", f"{self.git_user_name} <{self.git_user_email}>"),
             ("队列文件", str(self.queue_file)),
+            ("队列元数据", str(self.queue_meta_file)),
             ("构建包数量", f"{len(self.queue_packages)} 项"),
         ]
 
@@ -919,6 +928,10 @@ def manage_build_queue(state: MenuState) -> None:
         if choice == "查看队列":
             if not state.queue_packages:
                 console.print("[cyan]队列为空[/]")
+                if ask_confirm("是否扫描并生成构建列表?", default=True):
+                    handle_scan_and_generate(state)
+                    state.load_queue_from_file()
+                    continue
             for idx, pkg in enumerate(state.queue_packages, start=1):
                 kinds = [task.kind for task in state.build_queue if task.display_name == pkg]
                 kinds_text = ", ".join(sorted(set(kinds))) if kinds else "-"
@@ -935,6 +948,12 @@ def manage_build_queue(state: MenuState) -> None:
                         state.save_queue()
                         console.print(f"[yellow]已移除 {removed_pkg}[/]")
         elif choice == "添加任务":
+            mode = ask_select("请选择添加方式", ["手动选择源码包", "扫描并生成构建列表", "返回"])
+            if mode in (None, "返回"):
+                continue
+            if mode == "扫描并生成构建列表":
+                handle_scan_and_generate(state)
+                continue
             pkg_path = prompt_package_path(state)
             if not pkg_path:
                 continue
@@ -1147,11 +1166,15 @@ def handle_configuration(state: MenuState) -> None:
                 state.bloom_bin = bloom
         elif choice == "修改 构建队列文件路径":
             value = ask_text("构建队列文件路径", str(state.queue_file))
+            meta_value = ask_text("构建队列元数据文件路径 (留空则使用默认 .meta.json)", str(state.queue_meta_file))
             if value:
                 state.queue_file = state._normalize_path(value)
+            if meta_value:
+                state.queue_meta_file = state._normalize_path(meta_value)
+            else:
                 state.queue_meta_file = state._meta_path_for_queue(state.queue_file)
-                state.ensure_queue_file()
-                state.load_queue_from_file()
+            state.ensure_queue_file()
+            state.load_queue_from_file()
         elif choice == "修改 Debian 构建配置":
             code_label = ask_text("主界面源码前缀标签", state.code_label)
             deb_out = ask_text("Debian 输出目录", str(state.deb_out_dir))
@@ -1216,7 +1239,6 @@ def main() -> None:
             [
                 "下载 release 仓库",
                 "处理 tracks.yaml / 下载源码",
-                "扫描并生成构建列表",
                 "Bloom 打包",
                 "构建 (Build)",
                 "清理生成目录",
@@ -1229,8 +1251,6 @@ def main() -> None:
             handle_download_release(state)
         elif choice == "处理 tracks.yaml / 下载源码":
             handle_tracks_download(state)
-        elif choice == "扫描并生成构建列表":
-            handle_scan_and_generate(state)
         elif choice == "Bloom 打包":
             bloom_menu(state)
         elif choice == "构建 (Build)":
