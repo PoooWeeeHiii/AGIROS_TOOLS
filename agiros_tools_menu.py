@@ -6,7 +6,7 @@ import sys
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 try:
     from rich import box
@@ -152,9 +152,13 @@ class MenuState:
     git_user_email: str = os.environ.get("GIT_USER_EMAIL", "powehi041210@gmail.com")
     queue_file: Path = Path(os.environ.get("AGIROS_QUEUE_FILE", str(REPO_ROOT / "build_queue.txt")))
     build_queue: List[BuildTask] = field(default_factory=list)
+    queue_packages: List[str] = field(default_factory=list)
+    package_status: Dict[str, bool] = field(default_factory=dict)
+    queue_meta_file: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.queue_file = self._normalize_path(self.queue_file)
+        self.queue_meta_file = self._meta_path_for_queue(self.queue_file)
         self.ensure_queue_file()
         self.load_queue_from_file()
 
@@ -163,6 +167,10 @@ class MenuState:
         if not path.is_absolute():
             path = (REPO_ROOT / path).resolve()
         return path
+
+    def _meta_path_for_queue(self, queue_path: Path) -> Path:
+        base = str(queue_path)
+        return Path(f"{base}.meta.json")
 
     def update_env(self) -> None:
         mappings = {
@@ -200,6 +208,7 @@ class MenuState:
                 return
             if attr == "queue_file":
                 path = self._normalize_path(value)
+                self.queue_meta_file = self._meta_path_for_queue(path)
             else:
                 path = Path(value).expanduser()
                 try:
@@ -244,6 +253,7 @@ class MenuState:
         _set_str("GIT_USER_NAME", "git_user_name")
         _set_str("GIT_USER_EMAIL", "git_user_email")
         _set_path("AGIROS_QUEUE_FILE", "queue_file")
+        self.queue_meta_file = self._meta_path_for_queue(self.queue_file)
         self.ensure_queue_file()
         self.load_queue_from_file()
 
@@ -254,71 +264,186 @@ class MenuState:
             parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.touch()
-
-    def _serialize_task(self, task: BuildTask) -> str:
-        data = {
-            "name": task.display_name,
-            "kind": task.kind,
-            "path": str(task.path),
-            "extra_args": task.extra_args,
-        }
-        return json.dumps(data, ensure_ascii=False)
-
-    def _deserialize_task(self, raw: str) -> Optional[BuildTask]:
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        name = data.get("name")
-        kind = data.get("kind")
-        path_str = data.get("path")
-        if not name or not kind or not path_str:
-            return None
-        path = Path(path_str).expanduser()
-        extra_raw = data.get("extra_args")
-        if isinstance(extra_raw, list):
-            extra_args = [str(item) for item in extra_raw]
-        elif extra_raw:
-            extra_args = [str(extra_raw)]
-        else:
-            extra_args = []
-        return BuildTask(display_name=name, path=path, kind=kind, extra_args=extra_args)
+        meta_parent = self.queue_meta_file.parent
+        if not meta_parent.exists():
+            meta_parent.mkdir(parents=True, exist_ok=True)
+        if not self.queue_meta_file.exists():
+            self.queue_meta_file.write_text("{}", encoding="utf-8")
 
     def load_queue_from_file(self) -> List[BuildTask]:
         path = self.queue_file
         if not path.exists():
             self.build_queue = []
+            self.queue_packages = []
+            self.package_status = {}
             return []
-        tasks: List[BuildTask] = []
+        packages: List[str] = []
+        status: Dict[str, bool] = {}
+        legacy_meta: Dict[str, Dict[str, Any]] = {}
         with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
+            for raw_line in handle:
+                line = raw_line.strip()
                 if not line:
                     continue
-                task = self._deserialize_task(line)
-                if task:
-                    tasks.append(task)
+                parsed: Optional[Any] = None
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError:
+                        parsed = None
+                completed = False
+                name = ""
+                if isinstance(parsed, dict) and parsed.get("name"):
+                    name = str(parsed.get("name") or "").strip()
+                    completed = bool(parsed.get("completed", False))
+                    kind = str(parsed.get("kind", "debian"))
+                    path_str = str(parsed.get("path") or "")
+                    extra_raw = parsed.get("extra_args")
+                    extra_list: List[str] = []
+                    if isinstance(extra_raw, list):
+                        extra_list = [str(item) for item in extra_raw]
+                    elif extra_raw:
+                        extra_list = [str(extra_raw)]
+                    entry = legacy_meta.setdefault(name, {"path": path_str, "kinds": {}})
+                    if path_str:
+                        entry["path"] = path_str
+                    kinds_dict = entry.setdefault("kinds", {})
+                    if isinstance(kinds_dict, dict):
+                        kinds_dict[kind] = {"extra_args": extra_list}
+                else:
+                    if line.endswith("#"):
+                        completed = True
+                        line = line[:-1].strip()
+                    name = line.strip()
+                if not name:
+                    continue
+                if name not in packages:
+                    packages.append(name)
+                status[name] = status.get(name, False) or completed
+
+        meta: Dict[str, Dict[str, object]]
+        try:
+            meta_raw = self.queue_meta_file.read_text(encoding="utf-8")
+            loaded = json.loads(meta_raw) if meta_raw.strip() else {}
+            meta = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            meta = {}
+
+        if legacy_meta:
+            for pkg, info in legacy_meta.items():
+                existing = meta.get(pkg) if isinstance(meta.get(pkg), dict) else {}
+                merged_path = ""
+                if isinstance(existing, dict):
+                    merged_path = str(existing.get("path") or "")
+                info_path = str(info.get("path") or "")
+                path_to_use = info_path or merged_path
+                merged_kinds: Dict[str, Any] = {}
+                if isinstance(existing, dict) and isinstance(existing.get("kinds"), dict):
+                    merged_kinds.update(existing["kinds"])  # type: ignore[arg-type]
+                if isinstance(info.get("kinds"), dict):
+                    merged_kinds.update(info["kinds"])  # type: ignore[arg-type]
+                meta[pkg] = {"path": path_to_use, "kinds": merged_kinds}
+
+        tasks: List[BuildTask] = []
+        for pkg in packages:
+            info = meta.get(pkg, {})
+            base_path_str = ""
+            if isinstance(info, dict):
+                base_path_str = str(info.get("path") or "")
+                kinds_info = info.get("kinds") if isinstance(info.get("kinds"), dict) else {}
+            else:
+                kinds_info = {}
+            if base_path_str:
+                base_path = Path(base_path_str).expanduser()
+            else:
+                base_path = (self.code_dir / pkg).expanduser()
+            try:
+                base_path = base_path.resolve()
+            except Exception:
+                pass
+            if not kinds_info:
+                tasks.append(BuildTask(display_name=pkg, path=base_path, kind="debian", extra_args=[]))
+                continue
+            for kind, payload in kinds_info.items():
+                extra: List[str] = []
+                if isinstance(payload, dict):
+                    raw_extra = payload.get("extra_args")
+                    if isinstance(raw_extra, list):
+                        extra = [str(item) for item in raw_extra]
+                    elif raw_extra:
+                        extra = [str(raw_extra)]
+                tasks.append(BuildTask(display_name=pkg, path=base_path, kind=str(kind), extra_args=extra))
+
+        self.queue_packages = packages
+        self.package_status = status
         self.build_queue = tasks
         return tasks
 
     def save_queue(self, tasks: Optional[List[BuildTask]] = None) -> None:
         tasks = list(tasks if tasks is not None else self.build_queue)
-        self.ensure_queue_file()
-        with self.queue_file.open("w", encoding="utf-8") as handle:
-            for task in tasks:
-                handle.write(self._serialize_task(task) + "\n")
+        unique: List[BuildTask] = []
+        seen = set()
+        for task in tasks:
+            key = (task.display_name, task.kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(task)
+        tasks = unique
+        package_order = list(self.queue_packages)
+        for task in tasks:
+            if task.display_name not in package_order:
+                package_order.append(task.display_name)
+        # Remove packages without tasks
+        package_order = [pkg for pkg in package_order if any(t.display_name == pkg for t in tasks)]
+        status = {pkg: self.package_status.get(pkg, False) for pkg in package_order}
+        self.queue_packages = package_order
+        self.package_status = status
         self.build_queue = tasks
+        self._write_queue_file()
+        self._write_meta_from_tasks(tasks)
 
     def append_task_to_queue(self, task: BuildTask) -> None:
         self.ensure_queue_file()
-        with self.queue_file.open("a", encoding="utf-8") as handle:
-            handle.write(self._serialize_task(task) + "\n")
-        self.build_queue.append(task)
+        updated = False
+        for existing in self.build_queue:
+            if existing.display_name == task.display_name and existing.kind == task.kind:
+                existing.path = task.path
+                existing.extra_args = list(task.extra_args)
+                updated = True
+                break
+        if not updated:
+            self.build_queue.append(task)
+        if task.display_name not in self.queue_packages:
+            self.queue_packages.append(task.display_name)
+        # Reset completed flag after new addition
+        self.package_status[task.display_name] = False
+        self.save_queue()
 
     def clear_queue(self) -> None:
         self.ensure_queue_file()
         self.queue_file.write_text("", encoding="utf-8")
+        self.queue_meta_file.write_text("{}", encoding="utf-8")
+        self.queue_packages = []
+        self.package_status = {}
         self.build_queue = []
+
+    def _write_queue_file(self) -> None:
+        self.ensure_queue_file()
+        with self.queue_file.open("w", encoding="utf-8") as handle:
+            for pkg in self.queue_packages:
+                suffix = "#" if self.package_status.get(pkg) else ""
+                handle.write(f"{pkg}{suffix}\n")
+
+    def _write_meta_from_tasks(self, tasks: List[BuildTask]) -> None:
+        meta: Dict[str, Dict[str, object]] = {}
+        for task in tasks:
+            entry = meta.setdefault(task.display_name, {"path": str(task.path), "kinds": {}})
+            entry["path"] = str(task.path)
+            kinds = entry.setdefault("kinds", {})
+            if isinstance(kinds, dict):
+                kinds[task.kind] = {"extra_args": list(task.extra_args)}
+        self.queue_meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def summary_rows(self) -> List[Tuple[str, str]]:
         return [
@@ -340,7 +465,7 @@ class MenuState:
             ("并行构建线程", self.deb_parallel),
             ("Git User", f"{self.git_user_name} <{self.git_user_email}>"),
             ("队列文件", str(self.queue_file)),
-            ("构建队列", f"{len(self.build_queue)} 项"),
+            ("构建包数量", f"{len(self.queue_packages)} 项"),
         ]
 
 
@@ -718,18 +843,23 @@ def manage_build_queue(state: MenuState) -> None:
         if choice in (None, "返回"):
             return
         if choice == "查看队列":
-            if not state.build_queue:
+            if not state.queue_packages:
                 console.print("[cyan]队列为空[/]")
-            for idx, item in enumerate(state.build_queue, start=1):
-                console.print(f"{idx}. {describe_build_task(item, state)}")
-            if state.build_queue and ask_confirm("移除任务?", default=False):
+            for idx, pkg in enumerate(state.queue_packages, start=1):
+                kinds = [task.kind for task in state.build_queue if task.display_name == pkg]
+                kinds_text = ", ".join(sorted(set(kinds))) if kinds else "-"
+                mark = " #" if state.package_status.get(pkg) else ""
+                console.print(f"{idx}. {pkg}{mark} ({kinds_text})")
+            if state.queue_packages and ask_confirm("移除包?", default=False):
                 idx_raw = ask_text("输入要移除的编号", "")
                 if idx_raw and idx_raw.isdigit():
                     idx = int(idx_raw) - 1
-                    if 0 <= idx < len(state.build_queue):
-                        removed = state.build_queue.pop(idx)
+                    if 0 <= idx < len(state.queue_packages):
+                        removed_pkg = state.queue_packages.pop(idx)
+                        state.package_status.pop(removed_pkg, None)
+                        state.build_queue = [task for task in state.build_queue if task.display_name != removed_pkg]
                         state.save_queue()
-                        console.print(f"[yellow]已移除 {describe_build_task(removed, state)}[/]")
+                        console.print(f"[yellow]已移除 {removed_pkg}[/]")
         elif choice == "添加任务":
             pkg_path = prompt_package_path(state)
             if not pkg_path:
@@ -740,24 +870,42 @@ def manage_build_queue(state: MenuState) -> None:
             task = BuildTask(to_display_name(state, pkg_path), pkg_path, kind)
             state.append_task_to_queue(task)
         elif choice == "执行队列":
-            if not state.build_queue:
+            if not state.queue_packages:
                 console.print("[cyan]队列为空[/]")
                 continue
-            failed = []
-            tasks_to_run = list(state.build_queue)
-            for index, task in enumerate(tasks_to_run):
-                if not execute_build(task, state):
-                    failed.append(task)
-                    if not ask_confirm("继续执行剩余任务?", default=True):
-                        failed.extend(tasks_to_run[index + 1 :])
+            pending = [pkg for pkg in state.queue_packages if not state.package_status.get(pkg)]
+            if not pending:
+                console.print("[cyan]所有包均已标记完成 (#)，如需重新构建请先移除或重新加入。[/]")
+                continue
+            failed_packages: List[str] = []
+            aborted = False
+            for pkg in state.queue_packages:
+                tasks_for_pkg = [task for task in state.build_queue if task.display_name == pkg]
+                if not tasks_for_pkg:
+                    continue
+                if state.package_status.get(pkg):
+                    console.print(f"[cyan]{pkg} 已标记完成，跳过[/]")
+                    continue
+                package_failed = False
+                for task in tasks_for_pkg:
+                    if not execute_build(task, state):
+                        package_failed = True
                         break
-            state.save_queue(failed)
-            if failed:
-                console.print("[yellow]以下任务未完成，已保留在队列：[/]")
-                for task in failed:
-                    console.print(f"- {describe_build_task(task, state)}")
-            else:
-                console.print("[green]队列全部完成[/]")
+                if package_failed:
+                    failed_packages.append(pkg)
+                    state.package_status[pkg] = False
+                    if not ask_confirm("继续执行剩余包?", default=True):
+                        aborted = True
+                        break
+                else:
+                    state.package_status[pkg] = True
+            state.save_queue()
+            if failed_packages:
+                console.print("[yellow]以下包构建失败，已保持未完成状态：[/]")
+                for pkg in failed_packages:
+                    console.print(f"- {pkg}")
+            if not failed_packages and not aborted:
+                console.print("[green]队列包均已成功构建并标记为 #[/]")
         elif choice == "清空队列":
             state.clear_queue()
             console.print("[yellow]构建队列已清空[/]")
@@ -851,6 +999,7 @@ def handle_configuration(state: MenuState) -> None:
             value = ask_text("构建队列文件路径", str(state.queue_file))
             if value:
                 state.queue_file = state._normalize_path(value)
+                state.queue_meta_file = state._meta_path_for_queue(state.queue_file)
                 state.ensure_queue_file()
                 state.load_queue_from_file()
         elif choice == "修改 Debian 构建配置":
