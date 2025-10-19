@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import platform
 import shlex
 import sys
 import subprocess
@@ -315,6 +316,8 @@ class MenuState:
                         completed = True
                         line = line[:-1].strip()
                     name = line.strip()
+                if name:
+                    name = Path(name).name
                 if not name:
                     continue
                 if name not in packages:
@@ -328,6 +331,29 @@ class MenuState:
             meta = loaded if isinstance(loaded, dict) else {}
         except Exception:
             meta = {}
+
+        if meta:
+            normalized_meta: Dict[str, Dict[str, Any]] = {}
+            for key, value in meta.items():
+                new_key = Path(str(key)).name
+                if not new_key:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                if new_key in normalized_meta:
+                    # merge kinds/path if duplicates
+                    existing = normalized_meta[new_key]
+                    existing_path = str(existing.get("path") or "")
+                    incoming_path = str(value.get("path") or "")
+                    if incoming_path and not existing_path:
+                        existing["path"] = incoming_path
+                    kinds_existing = existing.setdefault("kinds", {})
+                    kinds_incoming = value.get("kinds")
+                    if isinstance(kinds_existing, dict) and isinstance(kinds_incoming, dict):
+                        kinds_existing.update(kinds_incoming)
+                else:
+                    normalized_meta[new_key] = value
+            meta = normalized_meta
 
         if legacy_meta:
             for pkg, info in legacy_meta.items():
@@ -384,7 +410,9 @@ class MenuState:
         unique: List[BuildTask] = []
         seen = set()
         for task in tasks:
-            key = (task.display_name, task.kind)
+            package_name = task.path.name
+            task.display_name = package_name
+            key = (package_name, task.kind)
             if key in seen:
                 continue
             seen.add(key)
@@ -392,33 +420,23 @@ class MenuState:
         tasks = unique
         package_order = list(self.queue_packages)
         for task in tasks:
-            if task.display_name not in package_order:
-                package_order.append(task.display_name)
+            package_name = task.path.name
+            if package_name not in package_order:
+                package_order.append(package_name)
         # Remove packages without tasks
-        package_order = [pkg for pkg in package_order if any(t.display_name == pkg for t in tasks)]
+        package_order = [pkg for pkg in package_order if any(t.path.name == pkg for t in tasks)]
         status = {pkg: self.package_status.get(pkg, False) for pkg in package_order}
         self.queue_packages = package_order
         self.package_status = status
-        self.build_queue = tasks
+        self.build_queue = []
+        for task in tasks:
+            task.display_name = task.path.name
+            self.build_queue.append(task)
         self._write_queue_file()
         self._write_meta_from_tasks(tasks)
 
     def append_task_to_queue(self, task: BuildTask) -> None:
-        self.ensure_queue_file()
-        updated = False
-        for existing in self.build_queue:
-            if existing.display_name == task.display_name and existing.kind == task.kind:
-                existing.path = task.path
-                existing.extra_args = list(task.extra_args)
-                updated = True
-                break
-        if not updated:
-            self.build_queue.append(task)
-        if task.display_name not in self.queue_packages:
-            self.queue_packages.append(task.display_name)
-        # Reset completed flag after new addition
-        self.package_status[task.display_name] = False
-        self.save_queue()
+        self.add_tasks([task])
 
     def clear_queue(self) -> None:
         self.ensure_queue_file()
@@ -427,6 +445,37 @@ class MenuState:
         self.queue_packages = []
         self.package_status = {}
         self.build_queue = []
+
+    def add_tasks(self, tasks: Sequence[BuildTask], *, reset_completed: bool = True) -> Tuple[int, int]:
+        if not tasks:
+            return (0, 0)
+        added = 0
+        total = 0
+        for task in tasks:
+            total += 1
+            package_name = task.path.name
+            task.display_name = package_name
+            replaced = False
+            for existing in self.build_queue:
+                if existing.path.name == package_name and existing.kind == task.kind:
+                    existing.path = task.path
+                    existing.extra_args = list(task.extra_args)
+                    existing.display_name = package_name
+                    replaced = True
+                    break
+            if not replaced:
+                self.build_queue.append(task)
+                added += 1
+            if package_name not in self.queue_packages:
+                self.queue_packages.append(package_name)
+            if not replaced:
+                self.package_status[package_name] = False
+            else:
+                if reset_completed or package_name not in self.package_status:
+                    self.package_status[package_name] = False
+            self.package_status.setdefault(package_name, False)
+        self.save_queue()
+        return added, total
 
     def _write_queue_file(self) -> None:
         self.ensure_queue_file()
@@ -564,6 +613,31 @@ def list_code_packages(code_dir: Path) -> List[Path]:
         return sorted(set(depth_limited_packages), key=lambda p: str(p))
 
     return [p for p in sorted(code_dir.iterdir()) if p.is_dir()]
+
+
+def detect_linux_distribution() -> Optional[str]:
+    os_id = ""
+    try:
+        info = platform.freedesktop_os_release()  # type: ignore[attr-defined]
+    except Exception:
+        info = {}
+    if isinstance(info, dict):
+        os_id = str(info.get("ID", "")).lower()
+    if not os_id:
+        os_release = Path("/etc/os-release")
+        if os_release.exists():
+            try:
+                for line in os_release.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("ID="):
+                        os_id = line.partition("=")[2].strip().strip('"').lower()
+                        break
+            except Exception:
+                os_id = ""
+    if "ubuntu" in os_id:
+        return "ubuntu"
+    if "openeuler" in os_id:
+        return "openeuler"
+    return None
 
 
 def prompt_package_path(state: MenuState) -> Optional[Path]:
@@ -707,22 +781,22 @@ def bloom_menu(state: MenuState) -> None:
             if choice == "生成 Debian 目录":
                 run_single_bloom(state, "debian", pkg_path, generate_gbp)
                 if ask_confirm("将 Debian 构建加入队列?", default=False):
-                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
+                    state.append_task_to_queue(BuildTask(pkg_path.name, pkg_path, "debian"))
             elif choice == "生成 spec 文件":
                 run_single_bloom(state, "rpm", pkg_path)
                 if ask_confirm("将 RPM 构建加入队列?", default=False):
-                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "rpm"))
+                    state.append_task_to_queue(BuildTask(pkg_path.name, pkg_path, "rpm"))
             elif choice == "生成 debian+spec":
                 run_single_bloom(state, "debian", pkg_path, generate_gbp)
                 run_single_bloom(state, "rpm", pkg_path)
                 if ask_confirm("将 Debian 构建加入队列?", default=False):
-                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
+                    state.append_task_to_queue(BuildTask(pkg_path.name, pkg_path, "debian"))
                 if ask_confirm("将 RPM 构建加入队列?", default=False):
-                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "rpm"))
+                    state.append_task_to_queue(BuildTask(pkg_path.name, pkg_path, "rpm"))
             else:
                 run_single_bloom(state, "gbp", pkg_path, True)
                 if ask_confirm("将 Debian 构建加入队列?", default=False):
-                    state.append_task_to_queue(BuildTask(to_display_name(state, pkg_path), pkg_path, "debian"))
+                    state.append_task_to_queue(BuildTask(pkg_path.name, pkg_path, "debian"))
         else:
             mode = {
                 "生成 Debian 目录": "debian",
@@ -867,7 +941,7 @@ def manage_build_queue(state: MenuState) -> None:
             kind = ask_select("构建类型", ["debian", "rpm"])
             if not kind:
                 continue
-            task = BuildTask(to_display_name(state, pkg_path), pkg_path, kind)
+            task = BuildTask(pkg_path.name, pkg_path, kind)
             state.append_task_to_queue(task)
         elif choice == "执行队列":
             if not state.queue_packages:
@@ -944,6 +1018,82 @@ def handle_clean(state: MenuState) -> None:
     rc = run_stream(["bash", str(script)], cwd=REPO_ROOT, env=env)
     if rc == 0:
         console.print("[green]清理完成[/]")
+
+
+def handle_scan_and_generate(state: MenuState) -> None:
+    state.refresh_from_env()
+    state.load_queue_from_file()
+    if not state.code_dir.exists():
+        console.print(f"[red]源码目录不存在: {state.code_dir}[/]")
+        return
+
+    detected = detect_linux_distribution()
+    target: Optional[str] = None
+    if detected == "ubuntu":
+        selection = ask_select(
+            "检测到当前系统为 Ubuntu，选择要扫描的目标？",
+            ["使用 Ubuntu (生成 debian 构建)", "改为 openEuler (生成 rpm 构建)", "返回"],
+        )
+        if selection == "使用 Ubuntu (生成 debian 构建)":
+            target = "ubuntu"
+        elif selection == "改为 openEuler (生成 rpm 构建)":
+            target = "openeuler"
+    elif detected == "openeuler":
+        selection = ask_select(
+            "检测到当前系统为 openEuler，选择要扫描的目标？",
+            ["使用 openEuler (生成 rpm 构建)", "改为 Ubuntu (生成 debian 构建)", "返回"],
+        )
+        if selection == "使用 openEuler (生成 rpm 构建)":
+            target = "openeuler"
+        elif selection == "改为 Ubuntu (生成 debian 构建)":
+            target = "ubuntu"
+    else:
+        selection = ask_select(
+            "请选择要扫描的目标系统",
+            ["Ubuntu (生成 debian 构建)", "openEuler (生成 rpm 构建)", "返回"],
+        )
+        if selection == "Ubuntu (生成 debian 构建)":
+            target = "ubuntu"
+        elif selection == "openEuler (生成 rpm 构建)":
+            target = "openeuler"
+
+    if target not in {"ubuntu", "openeuler"}:
+        console.print("[yellow]已取消扫描。[/]")
+        return
+
+    packages = list_code_packages(state.code_dir)
+    if not packages:
+        console.print("[yellow]未在源码目录找到任何 package.xml，无法生成构建列表。[/]")
+        return
+
+    if target == "ubuntu":
+        matched = [pkg for pkg in packages if (pkg / "debian").is_dir()]
+        build_kind = "debian"
+        os_label = "Ubuntu"
+    else:
+        matched = []
+        for pkg in packages:
+            rpm_dir = pkg / "rpm"
+            if rpm_dir.is_dir() and any(rpm_dir.glob("*.spec")):
+                matched.append(pkg)
+        build_kind = "rpm"
+        os_label = "openEuler"
+
+    if not matched:
+        console.print(f"[yellow]{os_label} 环境未找到已生成的 {build_kind} 构建目录。[/]")
+        return
+
+    tasks = [BuildTask(pkg.name, pkg, build_kind, []) for pkg in matched]
+    added, total = state.add_tasks(tasks, reset_completed=False)
+    new_count = added
+    existing_count = total - added
+
+    console.print(f"[green]扫描完成：共识别 {total} 个{os_label} 构建包。[/]")
+    if new_count:
+        console.print(f"[cyan]新增 {new_count} 个包至构建列表。[/]")
+    if existing_count:
+        console.print(f"[cyan]{existing_count} 个包已存在于构建列表，保持原有状态。[/]")
+    console.print(f"[dim]构建列表文件: {state.queue_file}[/]")
 
 
 def handle_configuration(state: MenuState) -> None:
@@ -1066,6 +1216,7 @@ def main() -> None:
             [
                 "下载 release 仓库",
                 "处理 tracks.yaml / 下载源码",
+                "扫描并生成构建列表",
                 "Bloom 打包",
                 "构建 (Build)",
                 "清理生成目录",
@@ -1078,6 +1229,8 @@ def main() -> None:
             handle_download_release(state)
         elif choice == "处理 tracks.yaml / 下载源码":
             handle_tracks_download(state)
+        elif choice == "扫描并生成构建列表":
+            handle_scan_and_generate(state)
         elif choice == "Bloom 打包":
             bloom_menu(state)
         elif choice == "构建 (Build)":
